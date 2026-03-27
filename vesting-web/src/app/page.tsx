@@ -8,8 +8,7 @@ import React, {
   useTransition,
   useCallback,
 } from "react";
-import * as StellarSdk from "@stellar/stellar-sdk";
-import { SorobanRpc } from "@stellar/stellar-sdk";
+import { SorobanRpc, xdr, TransactionBuilder } from "@stellar/stellar-sdk";
 import {
   isConnected,
   isAllowed,
@@ -22,12 +21,15 @@ import {
 import { Client as VestingClient } from "@/contracts/vesting/src/index";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const CONTRACT_ID =
-  process.env.NEXT_PUBLIC_VESTING_CONTRACT_ID ??
-  "CB0SKGLRKLRDLDBHNWCJXKCCPSOLJY3KX27QUBOKZPIB0WHIIH22KM2A";
-const TOKEN_ADDRESS =
-  process.env.NEXT_PUBLIC_TOKEN_ADDRESS ??
+const DEFAULT_CONTRACT_ID =
+  "CBOSKGLRKLRDLDBHNWCJXKCCPSOLJY3KX27QUBOKZPIBOWHIIH22KM2A";
+const DEFAULT_TOKEN_ADDRESS =
   "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+const CONTRACT_ID =
+  process.env.NEXT_PUBLIC_VESTING_CONTRACT_ID ?? DEFAULT_CONTRACT_ID;
+const TOKEN_ADDRESS =
+  process.env.NEXT_PUBLIC_TOKEN_ADDRESS ?? DEFAULT_TOKEN_ADDRESS;
 const RPC_URL =
   process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const NETWORK_PASSPHRASE =
@@ -42,21 +44,31 @@ function toDisplay(raw: bigint | number | string): string {
   const n = BigInt(raw);
   const whole = n / BigInt(STROOPS);
   const frac = n % BigInt(STROOPS);
-  const fracStr = frac.toString().padStart(TOKEN_DECIMALS, "0").replace(/0+$/, "");
+  const fracStr = frac
+    .toString()
+    .padStart(TOKEN_DECIMALS, "0")
+    .replace(/0+$/, "");
   return fracStr ? `${whole}.${fracStr}` : whole.toString();
 }
 
 function toRaw(display: string): bigint {
-  const [whole, frac = ""] = display.split(".");
+  const trimmed = display.trim();
+  if (!trimmed || isNaN(Number(trimmed))) return 0n;
+  const [whole, frac = ""] = trimmed.split(".");
   const fracPadded = frac.padEnd(TOKEN_DECIMALS, "0").slice(0, TOKEN_DECIMALS);
-  return BigInt(whole || "0") * BigInt(STROOPS) + BigInt(fracPadded || "0");
+  return (
+    BigInt(whole || "0") * BigInt(STROOPS) + BigInt(fracPadded || "0")
+  );
 }
 
 function tsToDate(ts: number | bigint): string {
-  return new Date(Number(ts) * 1000).toLocaleDateString(undefined, {
+  return new Date(Number(ts) * 1000).toLocaleString(undefined, {
     year: "numeric",
     month: "short",
     day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
   });
 }
 
@@ -77,42 +89,129 @@ const VESTING_ERRORS: Record<number, string> = {
 function parseContractError(err: unknown): string {
   const msg = String(err);
   const match = msg.match(/Error\(Contract, #(\d+)\)/);
-  if (match) return VESTING_ERRORS[Number(match[1])] ?? `Contract error #${match[1]}`;
+  if (match)
+    return (
+      VESTING_ERRORS[Number(match[1])] ?? `Contract error #${match[1]}`
+    );
   if (msg.includes("HostError")) return "Contract execution failed";
+  if (msg.toLowerCase().includes("rejected")) return "Transaction rejected by user";
+  if (msg.includes("switch")) return "Auth entry parsing failed — SDK version mismatch or invalid contract state";
   return msg.slice(0, 120);
 }
 
 const isValidStellarAddr = (s: string, prefix = "G") =>
   new RegExp(`^${prefix}[A-Z2-7]{55}$`).test(s);
 
-function buildClient(publicKey?: string) {
+async function isContractDeployed(contractId: string): Promise<boolean> {
+  if (!isValidStellarAddr(contractId, "C")) return false;
+  try {
+    const server = new SorobanRpc.Server(RPC_URL);
+    await server.getContractWasmByContractId(contractId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Extract tx hash from signAndSend result ──────────────────────────────────
+// The Soroban client's signAndSend() returns an AssembledTransaction whose
+// result shape varies by SDK version. We probe all known locations so we never
+// call .switch on an undefined value.
+function extractHash(result: unknown): string | undefined {
+  if (!result || typeof result !== "object") return undefined;
+  const r = result as Record<string, unknown>;
+
+  // SDK v1 shape
+  if (typeof r.hash === "string") return r.hash;
+
+  // SDK v2+ shape: sendTransactionResponse
+  const send = r.sendTransactionResponse as Record<string, unknown> | undefined;
+  if (send && typeof send.hash === "string") return send.hash;
+
+  // SDK v2+ shape: getTransactionResponse
+  const get = r.getTransactionResponse as Record<string, unknown> | undefined;
+  if (get && typeof get.id === "string") return get.id;
+
+  return undefined;
+}
+
+// ─── Build client ─────────────────────────────────────────────────────────────
+// KEY FIX: the signTransaction callback must return a plain XDR string.
+//
+// The ".switch is not a function" error occurs because the Soroban SDK calls
+// TransactionBuilder.fromXDR(signedXdr) on whatever this callback returns and
+// then immediately calls .toEnvelope().v().switch() on it to detect the
+// envelope type. If the callback returns an object ({ signedTxXdr, error })
+// instead of a string, fromXDR returns undefined/garbage, and .switch() on
+// that undefined throws the exact error you saw.
+//
+// Fix: always unwrap Freighter's response to a bare string before returning.
+function buildClient(contractId = CONTRACT_ID, publicKey?: string) {
+  if (!isValidStellarAddr(contractId, "C")) {
+    throw new Error(
+      "Invalid vesting contract ID: must be a valid Stellar contract ID starting with C"
+    );
+  }
   return new VestingClient({
-    contractId: CONTRACT_ID,
+    contractId,
     networkPassphrase: NETWORK_PASSPHRASE,
     rpcUrl: RPC_URL,
     publicKey,
-  });
-}
+    signTransaction: async (xdrStr: string) => {
+      // signTransaction from @stellar/freighter-api accepts the raw XDR string.
+      const raw = await signTransaction(xdrStr, {
+        network: "TESTNET",
+        networkPassphrase: NETWORK_PASSPHRASE,
+      });
 
-async function normaliseSign(
-  xdr: string,
-  network: string
-): Promise<string> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await (signTransaction as any)(xdr, { network });
-  if (typeof result === "string") return result;
-  if (result?.signedTxXdr) return result.signedTxXdr;
-  throw new Error(result?.error ?? "Signing failed");
+      // Freighter v1 returns a plain string directly.
+      if (typeof raw === "string") {
+        if (!raw) throw new Error("Freighter returned an empty signed XDR");
+        return raw;
+      }
+
+      // Freighter v2+ returns { signedTxXdr: string, error?: string }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const r = raw as any;
+
+      // Surface explicit errors before touching signedTxXdr
+      if (r?.error) {
+        const msg: string = String(r.error);
+        if (msg.toLowerCase().includes("reject") || msg.toLowerCase().includes("cancel")) {
+          throw new Error("Transaction rejected by user");
+        }
+        throw new Error(`Freighter error: ${msg}`);
+      }
+
+      // Validate the XDR string before returning so the SDK never receives
+      // an undefined/empty value that would cause the .switch() crash.
+      const signedXdr: string = r?.signedTxXdr ?? "";
+      if (!signedXdr) {
+        throw new Error(
+          "Freighter returned no signed XDR — the transaction may have been rejected"
+        );
+      }
+
+      // Sanity-check: confirm the returned string is valid base64 XDR so the
+      // SDK's fromXDR call never blows up with a cryptic .switch() error.
+      try {
+        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+      } catch {
+        throw new Error(
+          "Signed XDR returned by Freighter is invalid — cannot submit transaction"
+        );
+      }
+
+      return signedXdr;
+    },
+  });
 }
 
 // ─── Role detection ───────────────────────────────────────────────────────────
 async function fetchAdmin(): Promise<string | null> {
-  // TODO: Replace with actual admin address from your contract
-  const HARDCODED_ADMIN = 
+  const HARDCODED_ADMIN =
     process.env.NEXT_PUBLIC_ADMIN_ADDRESS ??
     "GCRGYF6I7FUTRJIC5RXCUUXISSQK7ZSI47FY6SISPV23JTKBHL2DSNLJ";
-  
-  console.log("Using hardcoded admin:", HARDCODED_ADMIN); // remove this later
   return HARDCODED_ADMIN;
 }
 
@@ -132,12 +231,60 @@ type VestingCard = VestingInfo & {
 
 type Role = "unknown" | "admin" | "user";
 
+// ─── Cliff Presets ────────────────────────────────────────────────────────────
+type CliffPreset = "none" | "10s" | "1y" | "5y" | "custom";
+
+interface CliffPresetOption {
+  id: CliffPreset;
+  label: string;
+  sublabel: string;
+  offsetSeconds: number | null;
+}
+
+const CLIFF_PRESETS: CliffPresetOption[] = [
+  {
+    id: "none",
+    label: "No Cliff",
+    sublabel: "Starts immediately",
+    offsetSeconds: 0,
+  },
+  {
+    id: "10s",
+    label: "10 Seconds",
+    sublabel: "For testing",
+    offsetSeconds: 10,
+  },
+  {
+    id: "1y",
+    label: "1 Year",
+    sublabel: "12-month cliff",
+    offsetSeconds: 365 * 24 * 60 * 60,
+  },
+  {
+    id: "5y",
+    label: "5 Years",
+    sublabel: "60-month cliff",
+    offsetSeconds: 5 * 365 * 24 * 60 * 60,
+  },
+  {
+    id: "custom",
+    label: "Custom",
+    sublabel: "Pick a date & time",
+    offsetSeconds: null,
+  },
+];
+
 // ─── Skeleton ────────────────────────────────────────────────────────────────
 function Skeleton({ className = "" }: { className?: string }) {
   return (
     <div
       className={`animate-pulse rounded bg-[#1a1f2e] ${className}`}
-      style={{ backgroundImage: "linear-gradient(90deg,#1a1f2e 25%,#252b3b 50%,#1a1f2e 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite" }}
+      style={{
+        backgroundImage:
+          "linear-gradient(90deg,#1a1f2e 25%,#252b3b 50%,#1a1f2e 75%)",
+        backgroundSize: "200% 100%",
+        animation: "shimmer 1.5s infinite",
+      }}
     />
   );
 }
@@ -157,7 +304,9 @@ function StatusBadge({ card }: { card: VestingCard }) {
     }
   }
   return (
-    <span className={`text-xs font-mono px-2 py-0.5 rounded-full border ${color}`}>
+    <span
+      className={`text-xs font-mono px-2 py-0.5 rounded-full border ${color}`}
+    >
       {label}
     </span>
   );
@@ -170,7 +319,10 @@ function ProgressBar({ value, max }: { value: bigint; max: bigint }) {
     <div className="h-1.5 rounded-full bg-[#1a1f2e] overflow-hidden">
       <div
         className="h-full rounded-full transition-all duration-700"
-        style={{ width: `${pct}%`, background: "linear-gradient(90deg, #6366f1, #818cf8)" }}
+        style={{
+          width: `${pct}%`,
+          background: "linear-gradient(90deg, #6366f1, #818cf8)",
+        }}
       />
     </div>
   );
@@ -178,21 +330,43 @@ function ProgressBar({ value, max }: { value: bigint; max: bigint }) {
 
 // ─── Input field ─────────────────────────────────────────────────────────────
 function Field({
-  label, value, onChange, placeholder, type = "text", note,
+  label,
+  value,
+  onChange,
+  placeholder,
+  type = "text",
+  note,
+  min,
+  children,
 }: {
-  label: string; value: string; onChange: (v: string) => void;
-  placeholder?: string; type?: string; note?: string;
+  label: string;
+  value?: string;
+  onChange?: (v: string) => void;
+  placeholder?: string;
+  type?: string;
+  note?: string;
+  min?: string;
+  children?: React.ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-xs font-mono text-slate-400 uppercase tracking-widest">{label}</label>
-      <input
-        type={type}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="bg-[#0d111c] border border-[#252b3b] rounded-lg px-3 py-2.5 text-sm text-slate-200 font-mono placeholder-slate-600 focus:outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/30 transition"
-      />
+      <label className="text-xs font-mono text-slate-400 uppercase tracking-widest">
+        {label}
+      </label>
+      <div className="relative flex items-center">
+        {children ? (
+          children
+        ) : (
+          <input
+            type={type}
+            value={value}
+            onChange={(e) => onChange?.(e.target.value)}
+            placeholder={placeholder}
+            min={min}
+            className="w-full bg-[#0d111c] border border-[#252b3b] rounded-lg px-3 py-2.5 text-sm text-slate-200 font-mono placeholder-slate-600 focus:outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/30 transition"
+          />
+        )}
+      </div>
       {note && <p className="text-xs text-slate-500">{note}</p>}
     </div>
   );
@@ -222,11 +396,72 @@ function TxResult({ hash, error }: { hash?: string; error?: string }) {
   );
 }
 
+// ─── Cliff Preset Selector ────────────────────────────────────────────────────
+function CliffPresetSelector({
+  selected,
+  onSelect,
+}: {
+  selected: CliffPreset;
+  onSelect: (preset: CliffPreset) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label className="text-xs font-mono text-slate-400 uppercase tracking-widest">
+        Cliff Period
+      </label>
+      <div className="grid grid-cols-4 gap-2">
+        {CLIFF_PRESETS.map((preset) => {
+          const isActive = selected === preset.id;
+          return (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => onSelect(preset.id)}
+              className={`
+                relative flex flex-col items-center justify-center gap-0.5
+                rounded-lg border px-2 py-3 text-center transition-all duration-150
+                ${isActive
+                  ? "border-indigo-500/60 bg-indigo-950/50 ring-1 ring-indigo-500/30"
+                  : "border-[#252b3b] bg-[#0d111c] hover:border-[#353d52] hover:bg-[#111827]"
+                }
+              `}
+            >
+              {isActive && (
+                <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-indigo-400" />
+              )}
+              <span
+                className={`text-sm font-mono font-semibold ${isActive ? "text-indigo-300" : "text-slate-200"
+                  }`}
+              >
+                {preset.label}
+              </span>
+              <span className="text-[10px] font-mono text-slate-500 leading-tight text-center">
+                {preset.sublabel}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ─── SECTION: Initialize ──────────────────────────────────────────────────────
-function InitializeSection({ address }: { address: string }) {
-  const [contractId, setContractId] = useState(CONTRACT_ID);
-  const [tokenAddr, setTokenAddr] = useState(TOKEN_ADDRESS);
+function InitializeSection({
+  address,
+  contractId: initialContractId,
+  tokenAddress: initialTokenAddress,
+  onConfigChange,
+}: {
+  address: string;
+  contractId: string;
+  tokenAddress: string;
+  onConfigChange: (contractId: string, tokenAddress: string) => void;
+}) {
+  const [contractId, setContractId] = useState(initialContractId);
+  const [tokenAddr, setTokenAddr] = useState(initialTokenAddress);
   const [isPending, startTransition] = useTransition();
+  const [contractExists, setContractExists] = useState<boolean | null>(null);
 
   const validContract = isValidStellarAddr(contractId, "C");
   const validToken = isValidStellarAddr(tokenAddr, "C");
@@ -234,32 +469,65 @@ function InitializeSection({ address }: { address: string }) {
   type S = { hash?: string; error?: string } | null;
   const [state, dispatch] = useActionState<S, void>(async () => {
     try {
-      const client = buildClient(address);
+      const client = buildClient(contractId, address);
       const assembled = await client.initialize({
         admin: address,
         token_address: tokenAddr,
       });
-      const signed = await normaliseSign(
-        assembled.toXDR(),
-        "TESTNET"
-      );
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await (assembled as any).signAndSend({ signedTxXdr: signed });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return { hash: (result as any).getTransactionResponse?.id };
+      const result = await assembled.signAndSend();
+      onConfigChange(contractId, tokenAddr);
+      return { hash: extractHash(result) };
     } catch (e) {
       return { error: parseContractError(e) };
     }
   }, null);
 
+  useEffect(() => {
+    let canceled = false;
+    if (!validContract) return;
+    (async () => {
+      const exists = await isContractDeployed(contractId);
+      if (!canceled) setContractExists(exists);
+    })();
+    return () => {
+      canceled = true;
+    };
+  }, [contractId, validContract]);
+
   return (
     <Section title="Initialize Contract" icon="⚙">
       <div className="flex flex-col gap-3">
-        <Field label="Contract ID" value={contractId} onChange={setContractId} placeholder="C…" />
-        <Field label="Token Address" value={tokenAddr} onChange={setTokenAddr} placeholder="C…" />
+        <Field
+          label="Contract ID"
+          value={contractId}
+          onChange={(v) => {
+            setContractId(v);
+            onConfigChange(v, tokenAddr);
+          }}
+          placeholder="C…"
+        />
+        <Field
+          label="Token Address"
+          value={tokenAddr}
+          onChange={(v) => {
+            setTokenAddr(v);
+            onConfigChange(contractId, v);
+          }}
+          placeholder="C…"
+        />
         <div className="flex gap-3 text-xs font-mono mt-1">
           <Chip ok={validContract} label="Valid contract ID" />
           <Chip ok={validToken} label="Valid token address" />
+          <Chip
+            ok={contractExists === true}
+            label={
+              contractExists === true
+                ? "Contract deployed"
+                : contractExists === false
+                  ? "Contract not found"
+                  : "Checking contract..."
+            }
+          />
         </div>
         <button
           disabled={!validContract || !validToken || isPending}
@@ -276,65 +544,266 @@ function InitializeSection({ address }: { address: string }) {
 
 function Chip({ ok, label }: { ok: boolean; label: string }) {
   return (
-    <span className={`flex items-center gap-1.5 ${ok ? "text-emerald-400" : "text-slate-500"}`}>
-      <span>{ok ? "✓" : "○"}</span>{label}
+    <span
+      className={`flex items-center gap-1.5 ${ok ? "text-emerald-400" : "text-slate-500"
+        }`}
+    >
+      <span>{ok ? "✓" : "○"}</span>
+      {label}
     </span>
   );
 }
 
 // ─── SECTION: Create Vesting ──────────────────────────────────────────────────
-function CreateVestingSection({ address }: { address: string }) {
+function formatDateTimeLocal(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+}
+
+function addSecondsToDateString(dateStr: string, seconds: number): string {
+  const base = new Date(dateStr);
+  if (isNaN(base.getTime())) return "";
+  base.setTime(base.getTime() + seconds * 1000);
+  return formatDateTimeLocal(base);
+}
+
+function CreateVestingSection({
+  address,
+  contractId,
+}: {
+  address: string;
+  contractId: string;
+}) {
+  const now = new Date();
+  const defaultStart = formatDateTimeLocal(now);
+
   const [beneficiary, setBeneficiary] = useState("");
   const [amount, setAmount] = useState("");
-  const [startDt, setStartDt] = useState("");
-  const [cliffDt, setCliffDt] = useState("");
-  const [durationDays, setDurationDays] = useState("");
+  const [startDt, setStartDt] = useState(defaultStart);
+
+  const [durationValue, setDurationValue] = useState("30");
+  const [durationUnit, setDurationUnit] = useState<"days" | "seconds">("days");
+
+  const [cliffPreset, setCliffPreset] = useState<CliffPreset>("none");
+  const [customCliffDt, setCustomCliffDt] = useState(
+    formatDateTimeLocal(new Date(now.getTime() + 24 * 60 * 60 * 1000))
+  );
+
   const [isPending, startTransition] = useTransition();
 
+  const effectiveCliffDt: string = (() => {
+    const preset = CLIFF_PRESETS.find((p) => p.id === cliffPreset)!;
+    if (preset.offsetSeconds === null) return customCliffDt;
+    return addSecondsToDateString(startDt, preset.offsetSeconds);
+  })();
+
+  const handleStartChange = (v: string) => {
+    setStartDt(v);
+    if (cliffPreset === "custom") {
+      const newStart = new Date(v);
+      const existingCliff = new Date(customCliffDt);
+      if (!isNaN(newStart.getTime()) && existingCliff < newStart) {
+        setCustomCliffDt(formatDateTimeLocal(newStart));
+      }
+    }
+  };
+
+  const handlePresetSelect = (preset: CliffPreset) => {
+    if (preset === "custom") {
+      const current = effectiveCliffDt;
+      setCustomCliffDt(current || addSecondsToDateString(startDt, 86400));
+    }
+    setCliffPreset(preset);
+  };
+
   const validBeneficiary = isValidStellarAddr(beneficiary, "G");
-  const canSubmit = validBeneficiary && amount && startDt && cliffDt && durationDays && !isPending;
+
+  const startTs = (() => {
+    const d = new Date(startDt);
+    return isNaN(d.getTime()) ? 0 : Math.floor(d.getTime() / 1000);
+  })();
+  const cliffTs = (() => {
+    const d = new Date(effectiveCliffDt);
+    return isNaN(d.getTime()) ? 0 : Math.floor(d.getTime() / 1000);
+  })();
+
+  const durationValNum = Number(durationValue);
+  const durationSecs =
+    !isNaN(durationValNum) && durationValNum > 0
+      ? Math.floor(durationValNum * (durationUnit === "days" ? 86400 : 1))
+      : 0;
+
+  const validDates = startTs > 0 && cliffTs > 0;
+  const cliffNotBeforeStart = cliffTs >= startTs;
+  const cliffWithinRange =
+    durationSecs > 0 && cliffTs <= startTs + durationSecs;
+  const validTimes = validDates && cliffNotBeforeStart && durationSecs > 0;
+
+  const properlySizedAmount = (() => {
+    const checked = Number(amount);
+    return !Number.isNaN(checked) && checked > 0;
+  })();
+
+  const canSubmit =
+    validBeneficiary &&
+    properlySizedAmount &&
+    validTimes &&
+    cliffWithinRange &&
+    !isPending;
 
   type S = { hash?: string; error?: string } | null;
   const [state, dispatch] = useActionState<S, void>(async () => {
     try {
-      const startTs = BigInt(Math.floor(new Date(startDt).getTime() / 1000));
-      const cliffTs = BigInt(Math.floor(new Date(cliffDt).getTime() / 1000));
-      const durationSecs = BigInt(Math.floor(Number(durationDays) * 86400));
+      const startTsBig = BigInt(startTs);
+      const cliffTsBig = BigInt(cliffTs);
+      const durationSecsBig = BigInt(Math.floor(durationSecs));
       const rawAmount = toRaw(amount);
 
-      // First approve token spend
-      // (Token approval must be done separately via token contract if needed)
-      const client = buildClient(address);
+      if (rawAmount === 0n) throw new Error("Amount must be greater than zero");
+
+      const client = buildClient(contractId, address);
       const assembled = await client.create_vesting({
         beneficiary,
         total_amount: rawAmount,
-        start_time: startTs,
-        cliff_time: cliffTs,
-        duration: durationSecs,
+        start_time: startTsBig,
+        cliff_time: cliffTsBig,
+        duration: durationSecsBig,
       });
-      const signed = await normaliseSign(assembled.toXDR(), "TESTNET");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await (assembled as any).signAndSend({ signedTxXdr: signed });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return { hash: (result as any).getTransactionResponse?.id };
+
+      // The SDK's signAndSend() → sign() internally calls needsNonInvokerSigningBy(),
+      // which calls .switch() on each auth entry's credentials. For invoker-type
+      // auth entries this crashes with "Cannot read properties of undefined (reading 'switch')".
+      // Work around it by signing the XDR manually through our buildClient callback,
+      // then reconstructing the signed transaction and sending it.
+      if (!assembled.built) throw new Error("Transaction simulation failed — no built tx");
+      const { signTransaction: sigFn } = client.options as any;
+      if (!sigFn) throw new Error("No signTransaction function configured");
+      const signedXdr: string = await sigFn(assembled.built.toXDR(), {
+        networkPassphrase: NETWORK_PASSPHRASE,
+      });
+      const { TransactionBuilder: TxBuilder } = await import("@stellar/stellar-sdk");
+      assembled.signed = TxBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any;
+      const result = await assembled.send();
+      return { hash: extractHash(result) };
     } catch (e) {
       return { error: parseContractError(e) };
     }
   }, null);
 
+  const cliffSummary = (() => {
+    if (cliffPreset === "none")
+      return "No cliff — vesting begins immediately at start time";
+    if (!cliffTs) return "Set a valid start time to compute cliff date";
+    const dateLabel = tsToDate(cliffTs);
+    if (cliffPreset === "custom")
+      return `Custom cliff — tokens unlock from ${dateLabel}`;
+    const p = CLIFF_PRESETS.find((x) => x.id === cliffPreset)!;
+    return `${p.label} cliff — tokens unlock from ${dateLabel}`;
+  })();
+
   return (
     <Section title="Create Vesting Schedule" icon="＋">
       <div className="flex flex-col gap-3">
-        <Field label="Beneficiary Address" value={beneficiary} onChange={setBeneficiary} placeholder="G…" />
-        <Field label="Total Amount" value={amount} onChange={setAmount} placeholder="100.0" type="text" note="Token units (7 decimals)" />
+        <Field
+          label="Beneficiary Address"
+          value={beneficiary}
+          onChange={setBeneficiary}
+          placeholder="G…"
+        />
+        <Field
+          label="Total Amount"
+          value={amount}
+          onChange={setAmount}
+          placeholder="100.0"
+          type="text"
+          note="Token units (7 decimals)"
+        />
+
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Start Time" value={startDt} onChange={setStartDt} type="datetime-local" />
-          <Field label="Cliff Time" value={cliffDt} onChange={setCliffDt} type="datetime-local" />
+          <Field
+            label="Start Time"
+            value={startDt}
+            onChange={handleStartChange}
+            type="datetime-local"
+            min={formatDateTimeLocal(new Date())}
+          />
+
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-mono text-slate-400 uppercase tracking-widest">
+              Duration
+            </label>
+            <div className="flex bg-[#0d111c] border border-[#252b3b] rounded-lg overflow-hidden focus-within:border-indigo-500/60 focus-within:ring-1 focus-within:ring-indigo-500/30 transition">
+              <input
+                type="number"
+                value={durationValue}
+                onChange={(e) => setDurationValue(e.target.value)}
+                placeholder="30"
+                min="1"
+                className="w-full bg-transparent px-3 py-2.5 text-sm text-slate-200 font-mono placeholder-slate-600 focus:outline-none"
+              />
+              <select
+                value={durationUnit}
+                onChange={(e) =>
+                  setDurationUnit(e.target.value as "days" | "seconds")
+                }
+                className="bg-[#1a1f2e] text-xs font-mono text-slate-300 border-l border-[#252b3b] px-2 outline-none cursor-pointer hover:bg-[#252b3b]"
+              >
+                <option value="days">Days</option>
+                <option value="seconds">Secs</option>
+              </select>
+            </div>
+          </div>
         </div>
-        <Field label="Duration (days)" value={durationDays} onChange={setDurationDays} placeholder="365" type="number" />
+
+        <CliffPresetSelector
+          selected={cliffPreset}
+          onSelect={handlePresetSelect}
+        />
+
+        {cliffPreset === "custom" && (
+          <Field
+            label="Custom Cliff Date & Time"
+            value={customCliffDt}
+            onChange={setCustomCliffDt}
+            type="datetime-local"
+            min={startDt}
+          />
+        )}
+
+        <div className="flex items-start gap-2 rounded-lg border border-indigo-500/20 bg-indigo-950/20 px-3 py-2.5">
+          <span className="text-indigo-400 mt-0.5 text-xs shrink-0">◆</span>
+          <span className="text-xs font-mono text-indigo-300/80">
+            {cliffSummary}
+          </span>
+        </div>
+
+        {!cliffNotBeforeStart && cliffTs > 0 && (
+          <p className="text-xs text-red-400 font-mono">
+            ✗ Cliff time cannot be before start time.
+          </p>
+        )}
+        {cliffNotBeforeStart && !cliffWithinRange && durationSecs > 0 && (
+          <p className="text-xs text-red-400 font-mono">
+            ✗ Cliff must be within the vesting duration (≤ start +{" "}
+            {durationSecs}s).
+          </p>
+        )}
+        {durationSecs === 0 && durationValue !== "" && (
+          <p className="text-xs text-red-400 font-mono">
+            ✗ Duration must be greater than zero.
+          </p>
+        )}
+
         <div className="text-xs text-slate-500 font-mono">
-          Note: Ensure the token contract has approved this contract to spend your tokens first.
+          Note: Ensure the token contract has approved this contract to spend
+          your tokens first.
         </div>
+
         <button
           disabled={!canSubmit}
           onClick={() => startTransition(() => dispatch())}
@@ -349,20 +818,25 @@ function CreateVestingSection({ address }: { address: string }) {
 }
 
 // ─── SECTION: Emergency Withdraw ──────────────────────────────────────────────
-function EmergencyWithdrawSection({ address }: { address: string }) {
+function EmergencyWithdrawSection({
+  address,
+  contractId,
+}: {
+  address: string;
+  contractId: string;
+}) {
   const [amount, setAmount] = useState("");
   const [isPending, startTransition] = useTransition();
 
   type S = { hash?: string; error?: string } | null;
   const [state, dispatch] = useActionState<S, void>(async () => {
     try {
-      const client = buildClient(address);
-      const assembled = await client.emergency_withdraw({ amount: toRaw(amount) });
-      const signed = await normaliseSign(assembled.toXDR(), "TESTNET");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await (assembled as any).signAndSend({ signedTxXdr: signed });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return { hash: (result as any).getTransactionResponse?.id };
+      const rawAmount = toRaw(amount);
+      if (rawAmount === 0n) throw new Error("Amount must be greater than zero");
+      const client = buildClient(contractId, address);
+      const assembled = await client.emergency_withdraw({ amount: rawAmount });
+      const result = await assembled.signAndSend();
+      return { hash: extractHash(result) };
     } catch (e) {
       return { error: parseContractError(e) };
     }
@@ -371,7 +845,14 @@ function EmergencyWithdrawSection({ address }: { address: string }) {
   return (
     <Section title="Emergency Withdraw" icon="⚠">
       <div className="flex flex-col gap-3">
-        <Field label="Amount" value={amount} onChange={setAmount} placeholder="0.0" type="text" note="Amount to withdraw back to admin" />
+        <Field
+          label="Amount"
+          value={amount}
+          onChange={setAmount}
+          placeholder="0.0"
+          type="text"
+          note="Amount to withdraw back to admin"
+        />
         <button
           disabled={!amount || isPending}
           onClick={() => startTransition(() => dispatch())}
@@ -386,7 +867,7 @@ function EmergencyWithdrawSection({ address }: { address: string }) {
 }
 
 // ─── SECTION: Lookup Beneficiary ──────────────────────────────────────────────
-function LookupSection() {
+function LookupSection({ contractId }: { contractId: string }) {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [schedules, setSchedules] = useState<VestingCard[] | null>(null);
@@ -397,7 +878,7 @@ function LookupSection() {
     setLoading(true);
     setLookupError("");
     try {
-      const cards = await fetchVestingSchedules(query);
+      const cards = await fetchVestingSchedules(query, contractId);
       setSchedules(cards);
     } catch (e) {
       setLookupError(parseContractError(e));
@@ -423,14 +904,24 @@ function LookupSection() {
           {loading ? "…" : "Lookup"}
         </button>
       </div>
-      {lookupError && <p className="text-xs text-red-400 font-mono mt-2">{lookupError}</p>}
+      {lookupError && (
+        <p className="text-xs text-red-400 font-mono mt-2">{lookupError}</p>
+      )}
       {schedules !== null && (
         <div className="mt-3 flex flex-col gap-3">
           {schedules.length === 0 ? (
-            <p className="text-xs text-slate-500 font-mono">No schedules found.</p>
+            <p className="text-xs text-slate-500 font-mono">
+              No schedules found.
+            </p>
           ) : (
             schedules.map((card) => (
-              <VestingCardView key={card.vesting_id} card={card} showClaim={false} address="" />
+              <VestingCardView
+                key={card.vesting_id}
+                card={card}
+                showClaim={false}
+                address=""
+                contractId={contractId}
+              />
             ))
           )}
         </div>
@@ -440,82 +931,77 @@ function LookupSection() {
 }
 
 // ─── Admin Dashboard ──────────────────────────────────────────────────────────
-function AdminDashboard({ address }: { address: string }) {
+function AdminDashboard({
+  address,
+  contractId,
+  tokenAddress,
+  onConfigChange,
+}: {
+  address: string;
+  contractId: string;
+  tokenAddress: string;
+  onConfigChange: (contractId: string, tokenAddress: string) => void;
+}) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-2 mb-1">
         <span className="text-xs font-mono px-2 py-0.5 rounded-full border border-violet-400/30 bg-violet-400/10 text-violet-300">
           Admin
         </span>
-        <span className="text-xs font-mono text-slate-500 truncate max-w-[220px]">{address}</span>
+        <span className="text-xs font-mono text-slate-500 truncate max-w-[220px]">
+          {address}
+        </span>
       </div>
-      <InitializeSection address={address} />
-      <CreateVestingSection address={address} />
-      <EmergencyWithdrawSection address={address} />
-      <LookupSection />
+      <InitializeSection
+        address={address}
+        contractId={contractId}
+        tokenAddress={tokenAddress}
+        onConfigChange={onConfigChange}
+      />
+      <CreateVestingSection address={address} contractId={contractId} />
+      <EmergencyWithdrawSection address={address} contractId={contractId} />
+      <LookupSection contractId={contractId} />
     </div>
   );
 }
 
 // ─── Fetch vesting schedules ──────────────────────────────────────────────────
-async function fetchVestingSchedules(address: string): Promise<VestingCard[]> {
-  const client = buildClient();
+async function fetchVestingSchedules(
+  address: string,
+  contractId: string
+): Promise<VestingCard[]> {
+  const client = buildClient(contractId);
   const cards: VestingCard[] = [];
   let i = 0;
   while (i < 50) {
     try {
       const tx = await client.get_vesting({ beneficiary: address, index: i });
-      // simulate to get return value
-      // info would be parsed from ScVal if needed
+      const vestingData = tx.result;
+      if (!vestingData) break;
 
-      // Fallback: use simulateTransaction approach
-      const server = new SorobanRpc.Server(RPC_URL);
-      const account = await server.getAccount(address).catch(() => null);
-      if (!account) break;
+      const vestInfo: VestingInfo = {
+        total_amount: BigInt(vestingData.total_amount),
+        claimed: BigInt(vestingData.claimed),
+        start_time: BigInt(vestingData.start_time),
+        cliff_time: BigInt(vestingData.cliff_time),
+        duration: BigInt(vestingData.duration),
+      };
 
-      const txToSim = (tx as any).toXDR?.() ?? tx;
-      const simResult = await server.simulateTransaction(txToSim);
-
-      if (!("result" in simResult) || !simResult.result) break;
-
-      // Try to decode VestingInfo from ScVal
-      const retval = simResult.result.retval;
-      if (retval.switch() === StellarSdk.xdr.ScValType.scvVoid()) break;
-      if (retval.switch() === StellarSdk.xdr.ScValType.scvMap()) {
-        const map = retval.map() ?? [];
-        const get = (k: string) =>
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          map.find((e: any) => e.key().sym?.().toString() === k)?.val();
-
-        const vestInfo: VestingInfo = {
-          total_amount: BigInt(get("total_amount")?.i128?.().lo?.().toString() ?? 0),
-          claimed: BigInt(get("claimed")?.i128?.().lo?.().toString() ?? 0),
-          start_time: BigInt(get("start_time")?.u64?.().toString() ?? 0),
-          cliff_time: BigInt(get("cliff_time")?.u64?.().toString() ?? 0),
-          duration: BigInt(get("duration")?.u64?.().toString() ?? 0),
-        };
-
-        // get claimable
-        let claimable = 0n;
-        try {
-          const claimTx = await client.get_claimable_amount({
-            beneficiary: address,
-            vesting_id: i,
-          });
-          const claimTxToSim = (claimTx as any).toXDR?.() ?? claimTx;
-          const claimSim = await server.simulateTransaction(claimTxToSim);
-          if ("result" in claimSim && claimSim.result) {
-            claimable = BigInt(claimSim.result.retval.i128?.().lo?.().toString() ?? 0);
-          }
-        } catch {
-          /* ignore */
+      let claimable = 0n;
+      try {
+        const claimTx = await client.get_claimable_amount({
+          beneficiary: address,
+          vesting_id: i,
+        });
+        if (claimTx.result !== undefined && claimTx.result !== null) {
+          claimable = BigInt(claimTx.result);
         }
-
-        cards.push({ ...vestInfo, vesting_id: i, claimable });
-        i++;
-      } else {
-        break;
+      } catch {
+        /* non-fatal */
       }
+
+      cards.push({ ...vestInfo, vesting_id: i, claimable });
+      i++;
     } catch {
       break;
     }
@@ -528,11 +1014,13 @@ function VestingCardView({
   card,
   showClaim,
   address,
+  contractId,
   onClaimed,
 }: {
   card: VestingCard;
   showClaim: boolean;
   address: string;
+  contractId: string;
   onClaimed?: (id: number) => void;
 }) {
   const [optimisticClaimed, addOptimistic] = useOptimistic(
@@ -541,22 +1029,53 @@ function VestingCardView({
   );
   const [isPending, startTransition] = useTransition();
 
+  // ── Real-time claimable ────────────────────────────────────────────────────
+  // The RPC simulation returns claimable as-of the simulated ledger time, which
+  // can be stale. We also compute it client-side using the linear vesting formula
+  // so the number updates every second without needing a refresh.
+  const [nowSecs, setNowSecs] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const id = setInterval(() => setNowSecs(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const liveClaimable = (() => {
+    const { total_amount, claimed, start_time, cliff_time, duration } = card;
+    if (nowSecs < Number(cliff_time)) return 0n;           // before cliff
+    if (duration === 0n) return total_amount - claimed;    // guard div-by-zero
+    const elapsed = BigInt(Math.min(nowSecs, Number(start_time + duration))) - start_time;
+    const vested = (total_amount * elapsed) / duration;
+    const claimableBig = vested > claimed ? vested - claimed : 0n;
+    return claimableBig > total_amount - claimed ? total_amount - claimed : claimableBig;
+  })();
+
+  // Use the larger of the RPC value and our live computation (RPC may have
+  // already deducted some claimed tokens the live formula doesn't know about).
+  const displayClaimable = liveClaimable > card.claimable ? liveClaimable : card.claimable;
+
   type S = { hash?: string; error?: string } | null;
   const [claimState, claimDispatch] = useActionState<S, void>(async () => {
     try {
-      const client = buildClient(address);
+      const client = buildClient(contractId, address);
       const assembled = await client.claim({
         beneficiary: address,
         vesting_id: card.vesting_id,
       });
-      const signed = await normaliseSign(assembled.toXDR(), "TESTNET");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await (assembled as any).signAndSend({ signedTxXdr: signed });
-      const newClaimed = optimisticClaimed + card.claimable;
+      // Same manual sign+send workaround as create_vesting — bypasses the
+      // SDK's needsNonInvokerSigningBy() which crashes on invoker-type auth entries.
+      if (!assembled.built) throw new Error("Transaction simulation failed — no built tx");
+      const sigFn = (client.options as any).signTransaction;
+      if (!sigFn) throw new Error("No signTransaction function configured");
+      const signedXdr: string = await sigFn(assembled.built.toXDR(), {
+        networkPassphrase: NETWORK_PASSPHRASE,
+      });
+      const { TransactionBuilder: TxBuilder } = await import("@stellar/stellar-sdk");
+      assembled.signed = TxBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any;
+      const result = await assembled.send();
+      const newClaimed = optimisticClaimed + displayClaimable;
       addOptimistic(newClaimed);
       onClaimed?.(card.vesting_id);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return { hash: (result as any).getTransactionResponse?.id };
+      return { hash: extractHash(result) };
     } catch (e) {
       return { error: parseContractError(e) };
     }
@@ -567,42 +1086,67 @@ function VestingCardView({
   return (
     <div className="rounded-xl border border-[#252b3b] bg-[#0d111c] p-4 flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <span className="text-xs font-mono text-slate-400">Schedule #{card.vesting_id}</span>
+        <span className="text-xs font-mono text-slate-400">
+          Schedule #{card.vesting_id}
+        </span>
         <StatusBadge card={{ ...card, claimed: optimisticClaimed }} />
       </div>
 
       <div className="grid grid-cols-2 gap-3 text-sm">
         <Stat label="Total" value={toDisplay(card.total_amount)} unit="tokens" />
-        <Stat label="Claimed" value={toDisplay(optimisticClaimed)} unit="tokens" accent="text-slate-300" />
+        <Stat
+          label="Claimed"
+          value={toDisplay(optimisticClaimed)}
+          unit="tokens"
+          accent="text-slate-300"
+        />
         <Stat
           label="Claimable Now"
-          value={toDisplay(card.claimable)}
+          value={toDisplay(displayClaimable)}
           unit="tokens"
           accent="text-indigo-300 font-semibold"
           highlight
         />
-        <Stat label="Remaining" value={toDisplay(card.total_amount - optimisticClaimed)} unit="tokens" />
+        <Stat
+          label="Remaining"
+          value={toDisplay(card.total_amount - optimisticClaimed)}
+          unit="tokens"
+        />
       </div>
 
       <ProgressBar value={optimisticClaimed} max={card.total_amount} />
       <div className="flex justify-between text-xs font-mono text-slate-500">
-        <span>{toDisplay(optimisticClaimed)} / {toDisplay(card.total_amount)}</span>
-        <span>{card.total_amount > 0n ? Number((optimisticClaimed * 100n) / card.total_amount) : 0}%</span>
+        <span>
+          {toDisplay(optimisticClaimed)} / {toDisplay(card.total_amount)}
+        </span>
+        <span>
+          {card.total_amount > 0n
+            ? Number((optimisticClaimed * 100n) / card.total_amount)
+            : 0}
+          %
+        </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 text-xs font-mono text-slate-500 border-t border-[#1a1f2e] pt-3">
-        <span>Cliff: <span className="text-slate-300">{tsToDate(card.cliff_time)}</span></span>
-        <span>Ends: <span className="text-slate-300">{tsToDate(endTime)}</span></span>
+      <div className="grid grid-cols-1 gap-1 text-xs font-mono text-slate-500 border-t border-[#1a1f2e] pt-3">
+        <span>
+          Cliff:{" "}
+          <span className="text-slate-300">{tsToDate(card.cliff_time)}</span>
+        </span>
+        <span>
+          Ends: <span className="text-slate-300">{tsToDate(endTime)}</span>
+        </span>
       </div>
 
       {showClaim && (
         <>
           <button
-            disabled={card.claimable === 0n || isPending}
+            disabled={displayClaimable === 0n || isPending}
             onClick={() => startTransition(() => claimDispatch())}
             className="rounded-lg px-4 py-2 text-sm font-mono font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed transition text-white w-full"
           >
-            {isPending ? "Claiming…" : `Claim ${toDisplay(card.claimable)} tokens`}
+            {isPending
+              ? "Claiming…"
+              : `Claim ${toDisplay(displayClaimable)} tokens`}
           </button>
           <TxResult hash={claimState?.hash} error={claimState?.error} />
         </>
@@ -612,12 +1156,25 @@ function VestingCardView({
 }
 
 function Stat({
-  label, value, unit, accent = "text-slate-200", highlight = false,
+  label,
+  value,
+  unit,
+  accent = "text-slate-200",
+  highlight = false,
 }: {
-  label: string; value: string; unit: string; accent?: string; highlight?: boolean;
+  label: string;
+  value: string;
+  unit: string;
+  accent?: string;
+  highlight?: boolean;
 }) {
   return (
-    <div className={`flex flex-col gap-0.5 rounded-lg p-2 ${highlight ? "bg-indigo-950/30 border border-indigo-500/20" : "bg-[#131825]"}`}>
+    <div
+      className={`flex flex-col gap-0.5 rounded-lg p-2 ${highlight
+          ? "bg-indigo-950/30 border border-indigo-500/20"
+          : "bg-[#131825]"
+        }`}
+    >
       <span className="text-xs text-slate-500 font-mono">{label}</span>
       <span className={`text-sm font-mono ${accent}`}>{value}</span>
       <span className="text-xs text-slate-600 font-mono">{unit}</span>
@@ -626,7 +1183,13 @@ function Stat({
 }
 
 // ─── User Dashboard ───────────────────────────────────────────────────────────
-function UserDashboard({ address }: { address: string }) {
+function UserDashboard({
+  address,
+  contractId,
+}: {
+  address: string;
+  contractId: string;
+}) {
   const [schedules, setSchedules] = useState<VestingCard[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState("");
@@ -635,14 +1198,14 @@ function UserDashboard({ address }: { address: string }) {
     setLoading(true);
     setFetchError("");
     try {
-      const cards = await fetchVestingSchedules(address);
+      const cards = await fetchVestingSchedules(address, contractId);
       setSchedules(cards);
     } catch (e) {
       setFetchError(parseContractError(e));
     } finally {
       setLoading(false);
     }
-  }, [address]);
+  }, [address, contractId]);
 
   useEffect(() => {
     loadSchedules();
@@ -655,7 +1218,9 @@ function UserDashboard({ address }: { address: string }) {
           <span className="text-xs font-mono px-2 py-0.5 rounded-full border border-sky-400/30 bg-sky-400/10 text-sky-300">
             Beneficiary
           </span>
-          <span className="text-xs font-mono text-slate-500 truncate max-w-[200px]">{address}</span>
+          <span className="text-xs font-mono text-slate-500 truncate max-w-[200px]">
+            {address}
+          </span>
         </div>
         <button
           onClick={loadSchedules}
@@ -669,7 +1234,10 @@ function UserDashboard({ address }: { address: string }) {
       {loading ? (
         <div className="flex flex-col gap-3">
           {[0, 1].map((i) => (
-            <div key={i} className="rounded-xl border border-[#252b3b] p-4 flex flex-col gap-3">
+            <div
+              key={i}
+              className="rounded-xl border border-[#252b3b] p-4 flex flex-col gap-3"
+            >
               <Skeleton className="h-4 w-24" />
               <div className="grid grid-cols-2 gap-3">
                 <Skeleton className="h-16" />
@@ -698,6 +1266,7 @@ function UserDashboard({ address }: { address: string }) {
               card={card}
               showClaim={true}
               address={address}
+              contractId={contractId}
               onClaimed={() => loadSchedules()}
             />
           ))}
@@ -709,9 +1278,13 @@ function UserDashboard({ address }: { address: string }) {
 
 // ─── Section wrapper ──────────────────────────────────────────────────────────
 function Section({
-  title, icon, children,
+  title,
+  icon,
+  children,
 }: {
-  title: string; icon: string; children: React.ReactNode;
+  title: string;
+  icon: string;
+  children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(true);
   return (
@@ -745,7 +1318,7 @@ function ConnectPanel({ onConnect }: { onConnect: (addr: string) => void }) {
       if (!allowed) await requestAccess();
       const addr = await getAddress();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const address = typeof addr === 'string' ? addr : (addr as any)?.address;
+      const address = typeof addr === "string" ? addr : (addr as any)?.address;
       if (!address) throw new Error("Could not get address");
       onConnect(address);
     } catch (e) {
@@ -760,7 +1333,9 @@ function ConnectPanel({ onConnect }: { onConnect: (addr: string) => void }) {
         ◆
       </div>
       <div className="text-center">
-        <h2 className="text-xl font-semibold text-slate-100 mb-1">Vesting Protocol</h2>
+        <h2 className="text-xl font-semibold text-slate-100 mb-1">
+          Vesting Protocol
+        </h2>
         <p className="text-sm text-slate-400 font-mono">Stellar Testnet</p>
       </div>
       <button
@@ -771,7 +1346,9 @@ function ConnectPanel({ onConnect }: { onConnect: (addr: string) => void }) {
         {status === "connecting" ? "Connecting…" : "Connect Freighter"}
       </button>
       {error && (
-        <p className="text-xs text-red-400 font-mono text-center max-w-xs">{error}</p>
+        <p className="text-xs text-red-400 font-mono text-center max-w-xs">
+          {error}
+        </p>
       )}
     </div>
   );
@@ -784,6 +1361,10 @@ export default function VestingDApp() {
   const [role, setRole] = useState<Role>("unknown");
   const [detectingRole, setDetectingRole] = useState(false);
 
+  const [effectiveContractId, setEffectiveContractId] = useState(CONTRACT_ID);
+  const [effectiveTokenAddress, setEffectiveTokenAddress] =
+    useState(TOKEN_ADDRESS);
+
   useEffect(() => {
     setMounted(true);
   }, []);
@@ -793,17 +1374,12 @@ export default function VestingDApp() {
     setDetectingRole(true);
     try {
       const admin = await fetchAdmin();
-      console.log("Connected address:", addr);
-      console.log("Admin address from contract:", admin);
       if (admin && admin === addr) {
-        console.log("Role: admin");
         setRole("admin");
       } else {
-        console.log("Role: user");
         setRole("user");
       }
-    } catch (e) {
-      console.error("Error detecting role:", e);
+    } catch {
       setRole("user");
     } finally {
       setDetectingRole(false);
@@ -825,12 +1401,15 @@ export default function VestingDApp() {
           "radial-gradient(ellipse at 20% 20%, rgba(99,102,241,0.07) 0%, transparent 60%), radial-gradient(ellipse at 80% 80%, rgba(139,92,246,0.05) 0%, transparent 60%)",
       }}
     >
-      {/* Header */}
       <header className="border-b border-[#1a1f2e] px-4 py-3 flex items-center justify-between sticky top-0 bg-[#060a12]/90 backdrop-blur z-10">
         <div className="flex items-center gap-2">
           <span className="text-indigo-400 text-lg">◆</span>
-          <span className="text-sm font-mono font-semibold text-slate-200">VestingProtocol</span>
-          <span className="text-xs font-mono text-slate-500 hidden sm:block">/ Testnet</span>
+          <span className="text-sm font-mono font-semibold text-slate-200">
+            VestingProtocol
+          </span>
+          <span className="text-xs font-mono text-slate-500 hidden sm:block">
+            / Testnet
+          </span>
         </div>
         {address && (
           <div className="flex items-center gap-3">
@@ -847,7 +1426,6 @@ export default function VestingDApp() {
         )}
       </header>
 
-      {/* Body */}
       <main className="max-w-xl mx-auto px-4 py-8">
         {!address ? (
           <ConnectPanel onConnect={handleConnect} />
@@ -857,9 +1435,20 @@ export default function VestingDApp() {
             <p className="text-sm font-mono text-slate-400">Detecting role…</p>
           </div>
         ) : role === "admin" ? (
-          <AdminDashboard address={address} />
+          <AdminDashboard
+            address={address}
+            contractId={effectiveContractId}
+            tokenAddress={effectiveTokenAddress}
+            onConfigChange={(c, t) => {
+              setEffectiveContractId(c);
+              setEffectiveTokenAddress(t);
+            }}
+          />
         ) : (
-          <UserDashboard address={address} />
+          <UserDashboard
+            address={address}
+            contractId={effectiveContractId}
+          />
         )}
       </main>
 

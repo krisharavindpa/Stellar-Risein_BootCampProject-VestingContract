@@ -1,0 +1,4 @@
+# Ignore generated contract bindings and compiled output
+src/contracts/**
+node_modules/**
+.next/**
