@@ -42,8 +42,11 @@ npm install
 Create a .env.local file in the root directory:
 
 Code snippet
+
 NEXT_PUBLIC_VESTING_CONTRACT_ID=your_contract_id_here
-NEXT_PUBLIC_TOKEN_ADDRESS=CDLZFC3SYJYDZT7K67VZ75YJ3LPP2VXD535YY2G6S2Z7SFCY56267SU
+
+NEXT_PUBLIC_TOKEN_ADDRESS= CDLZFC3SYJYDZT7K67VZ75YJ3LPP2VXD535YY2G6S2Z7SFCY56267SU
+
 5. Generate Contract Bindings
 If you have updated the Rust contract, regenerate the TypeScript client:
 
